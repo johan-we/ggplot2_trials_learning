@@ -4,7 +4,7 @@
 # Creates publication-ready maps using ggplot2 with hillshade background
 # 
 # Usage:
-#   Rscript scripts/03_make_maps.R
+#   Rscript scripts/03_make_maps.R [--variant academic|editorial] [--year YEAR]
 
 # Load required libraries
 suppressPackageStartupMessages({
@@ -16,6 +16,39 @@ suppressPackageStartupMessages({
   library(raster)
   library(terra)
 })
+
+# Use Cairo graphics device for better UTF-8 support (if available)
+if (requireNamespace("Cairo", quietly = TRUE)) {
+  options(bitmapType = "cairo")
+}
+
+# Try to enable showtext for better Unicode font support
+if (requireNamespace("showtext", quietly = TRUE)) {
+  showtext::showtext_auto()
+  # Try to load a font with good Unicode support
+  if (requireNamespace("sysfonts", quietly = TRUE)) {
+    # Try common fonts with good Unicode support
+    font_families <- c("Noto Sans", "DejaVu Sans", "Arial Unicode MS", "Liberation Sans")
+    font_loaded <- FALSE
+    for (font_name in font_families) {
+      tryCatch({
+        sysfonts::font_add_google(font_name, regular.wt = 400, bold.wt = 700)
+        font_loaded <- TRUE
+        break
+      }, error = function(e) {
+        # Try system font
+        tryCatch({
+          sysfonts::font_add(font_name, regular = paste0(font_name, ".ttf"))
+          font_loaded <- TRUE
+        }, error = function(e2) {})
+      })
+    }
+    if (!font_loaded) {
+      # Fallback to default sans
+      cat("Using default sans font for Unicode support\n")
+    }
+  }
+}
 
 # Configuration
 # Determine project root (parent of scripts directory)
@@ -39,6 +72,98 @@ OUTPUT_DIR <- file.path(PROJECT_ROOT, "outputs")
 # Ensure output directory exists
 dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
+# Parse command-line arguments
+args <- commandArgs(trailingOnly = TRUE)
+# Always use natgeo style (National Geographic editorial quality)
+TEXT_VARIANT <- "natgeo"
+
+YEAR <- if ("--year" %in% args) {
+  idx <- which(args == "--year")
+  if (length(idx) > 0 && idx < length(args)) {
+    as.integer(args[idx + 1])
+  } else {
+    2023
+  }
+} else {
+  2023  # Default year
+}
+
+# Source map text functions
+source(file.path(PROJECT_ROOT, "scripts", "map_text_functions.R"))
+
+# Set UTF-8 encoding for proper handling of German umlauts
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+options(encoding = "UTF-8")
+
+# ============================================================================
+# Typography Helper Functions
+# ============================================================================
+
+#' Format typography: convert markup to proper Unicode
+#' Converts NO[2]/NO2 -> NO₂, mu*g/m^3/ug/m3 -> µg/m³, >= -> ≥, etc.
+format_typography <- function(x) {
+  if (is.null(x) || length(x) == 0) return(x)
+  if (!is.character(x)) return(x)
+  
+  result <- x
+  
+  # NO2 / NO[2] -> NO₂ (subscript 2)
+  result <- gsub("NO\\[2\\]", "NO₂", result)
+  result <- gsub("NO2(?!₀-₉)", "NO₂", result, perl = TRUE)  # NO2 not followed by another subscript
+  
+  # Various forms of micrograms per cubic meter -> µg/m³
+  result <- gsub("mu\\*g/m\\^3", "µg/m³", result)
+  result <- gsub("\\(mu\\*g/m\\^3\\)", "(µg/m³)", result)
+  result <- gsub("ug/m3", "µg/m³", result)
+  result <- gsub("ug/m\\^3", "µg/m³", result)
+  result <- gsub("µg/m3", "µg/m³", result)
+  
+  # Greater than or equal
+  result <- gsub(">=", "≥", result)
+  result <- gsub("&gt;=", "≥", result)
+  
+  # Year ranges: hyphen to en dash
+  result <- gsub("(\\d{4})-(\\d{4})", "\\1–\\2", result)  # 2019-2023 -> 2019–2023
+  result <- gsub("(\\d{4}) - (\\d{4})", "\\1 – \\2", result)  # With spaces
+  
+  return(result)
+}
+
+# ============================================================================
+# City data for labeling
+# ============================================================================
+
+# 5 largest cities in Bayern (by population)
+# Using UTF-8 characters directly (file must be saved with UTF-8 encoding)
+bayern_cities <- tibble::tribble(
+  ~name, ~lon, ~lat,
+  "München", 11.5761, 48.1371,
+  "Nürnberg", 11.0775, 49.4521,
+  "Augsburg", 10.8978, 48.3705,
+  "Regensburg", 12.1016, 49.0134,
+  "Ingolstadt", 11.4257, 48.7665
+)
+# Ensure UTF-8 encoding
+bayern_cities$name <- enc2utf8(bayern_cities$name)
+
+# Largest cities in Oberpfalz
+oberpfalz_cities <- tibble::tribble(
+  ~name, ~lon, ~lat,
+  "Regensburg", 12.1016, 49.0134,
+  "Weiden", 12.1600, 49.6750,
+  "Amberg", 11.8578, 49.4436,
+  "Schwandorf", 12.1100, 49.3264,
+  "Cham", 12.6636, 49.2256
+)
+
+# Convert to sf objects (WGS84, will be transformed to map CRS)
+bayern_cities_sf <- st_as_sf(bayern_cities, coords = c("lon", "lat"), crs = 4326)
+oberpfalz_cities_sf <- st_as_sf(oberpfalz_cities, coords = c("lon", "lat"), crs = 4326)
+
+# ============================================================================
+# Bivariate color palette
+# ============================================================================
+
 # Bivariate color palette (3x3 = 9 colors)
 # Format: "y-x" where y=commuting (vertical), x=pollution (horizontal)
 # Colors from Joshua Stevens' bivariate palette examples
@@ -55,7 +180,10 @@ bivar_palette <- tibble::tribble(
   "1-1", "#CABED0"   # Low commute, Low pollution
 )
 
+# ============================================================================
 # Load data
+# ============================================================================
+
 cat("Loading processed data...\n")
 bayern_path <- file.path(DATA_PROCESSED, "bayern_bivariate.gpkg")
 oberpfalz_path <- file.path(DATA_PROCESSED, "oberpfalz_bivariate.gpkg")
@@ -116,6 +244,10 @@ if (!"group" %in% names(bayern)) {
   oberpfalz <- oberpfalz %>% left_join(bivar_palette, by = "group")
 }
 
+# ============================================================================
+# Theme
+# ============================================================================
+
 # Custom theme with typography hierarchy
 theme_map <- function() {
   theme_minimal() +
@@ -130,14 +262,16 @@ theme_map <- function() {
         hjust = 0.5, 
         size = 18, 
         face = "bold",
-        margin = margin(b = 8, t = 10)
+        margin = margin(b = 8, t = 10),
+        family = "sans"
       ),
       # Subheader - subtitle
       plot.subtitle = element_text(
         hjust = 0.5, 
         size = 14, 
         face = "bold",
-        margin = margin(b = 6, t = 0)
+        margin = margin(b = 6, t = 0),
+        family = "sans"
       ),
       # Description - caption
       plot.caption = element_text(
@@ -145,14 +279,21 @@ theme_map <- function() {
         size = 10,
         face = "plain",
         color = "gray40",
-        margin = margin(t = 8, b = 0)
+        margin = margin(t = 8, b = 0),
+        family = "sans"  # Ensure Unicode support for subscripts/superscripts
       ),
+      # Ensure all text uses sans font for Unicode support
+      text = element_text(family = "sans"),
       plot.margin = margin(1, 0.5, 0.5, 0.5, "cm")
     )
 }
 
+# ============================================================================
+# Map creation function
+# ============================================================================
+
 # Function to create map with proper headers and descriptions
-make_map <- function(sf_obj, title, subtitle = NULL, description = NULL, hill_df = NULL) {
+make_map <- function(sf_obj, title, subtitle = NULL, description = NULL, hill_df = NULL, cities_sf = NULL) {
   p <- ggplot(sf_obj)
   
   # Add hillshade if available
@@ -170,59 +311,151 @@ make_map <- function(sf_obj, title, subtitle = NULL, description = NULL, hill_df
   # Add polygons
   p <- p +
     geom_sf(aes(fill = fill), color = "white", linewidth = 0.1, alpha = 0.8) +
-    scale_fill_identity() +
+    scale_fill_identity()
+  
+  # Add city labels if provided
+  if (!is.null(cities_sf) && nrow(cities_sf) > 0) {
+    # Transform cities to map CRS
+    cities_transformed <- st_transform(cities_sf, st_crs(sf_obj))
+    
+    # Extract coordinates for labeling
+    coords <- st_coordinates(cities_transformed)
+    # Ensure UTF-8 encoding for city names
+    city_names_utf8 <- enc2utf8(cities_sf$name)
+    cities_df <- data.frame(
+      name = city_names_utf8,
+      x = coords[, 1],
+      y = coords[, 2],
+      stringsAsFactors = FALSE
+    )
+    
+    # Add city square markers - all white
+    p <- p +
+      geom_point(
+        data = cities_df,
+        aes(x = x, y = y),
+        color = "white",  # White stroke
+        fill = "white",   # White fill
+        shape = 22,       # Square shape (filled square)
+        size = 2.2,
+        stroke = 0.5,
+        inherit.aes = FALSE,
+        show.legend = FALSE
+      )
+    
+    # Add city name labels - plain white text, no shadow/halo
+    p <- p +
+      geom_text(
+        data = cities_df,
+        aes(x = x, y = y, label = name),
+        color = "white",
+        size = 3.6,
+        fontface = "bold",
+        family = "sans",
+        hjust = 0.5,
+        vjust = 1.4,  # Position above marker
+        inherit.aes = FALSE,
+        show.legend = FALSE
+      )
+  }
+  
+  # Apply typography formatting and add labels
+  # For natgeo variant: always use Unicode directly, never plotmath
+  title_formatted <- format_typography(title)
+  subtitle_formatted <- format_typography(subtitle)
+  caption_formatted <- format_typography(description)
+  
+  p <- p +
     labs(
-      title = title,
-      subtitle = subtitle,
-      caption = description
+      title = title_formatted,
+      subtitle = subtitle_formatted,
+      caption = caption_formatted
     ) +
     theme_map()
   
   return(p)
 }
 
+# ============================================================================
+# Legend creation
+# ============================================================================
+
 # Create bivariate legend
 create_legend <- function() {
   legend_df <- bivar_palette %>%
     separate(group, into = c("y", "x"), sep = "-", convert = TRUE)
+  
+  # Use "nitrogen dioxide" instead of NO₂, and proper arrows using plotmath
+  # Use expression() with proper plotmath syntax for arrows
+  # Both arrows point to the right (→) to indicate direction of increase
+  x_label <- expression(paste("Nitrogen dioxide increases ", symbol("\256")))
+  y_label <- expression(paste("Long-distance commuting increases ", symbol("\256")))
   
   ggplot(legend_df) +
     geom_tile(aes(x = x, y = y, fill = fill), color = "white", linewidth = 0.5) +
     scale_fill_identity() +
     labs(
       title = "Bivariate Legend",
-      x = "Higher NO₂ ⟶",
-      y = "Higher commuting ⟶"
+      x = x_label,
+      y = y_label
     ) +
     coord_fixed() +
     theme_minimal() +
     theme(
-      plot.title = element_text(size = 10, face = "bold", hjust = 0.5, margin = margin(b = 6)),
-      axis.text = element_text(size = 8),
-      axis.title = element_text(size = 9, face = "bold"),
+      plot.title = element_text(size = 9, face = "bold", hjust = 0.5, margin = margin(b = 4), family = "sans"),
+      axis.text = element_text(size = 7, family = "sans"),
+      axis.title = element_text(size = 7, face = "bold", family = "sans"),
+      axis.title.x = element_text(margin = margin(t = 8, b = 1), angle = 0, vjust = 1, hjust = 0.5),
+      axis.title.y = element_text(margin = margin(r = 8, l = 1), angle = 90, vjust = 0.5, hjust = 0.5),
       panel.grid = element_blank(),
       plot.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
-      plot.margin = margin(0.4, 0.3, 0.3, 0.3, "cm")
+      plot.margin = margin(0.9, 0.7, 0.7, 0.7, "cm"),  # Large margins to ensure text fits
+      text = element_text(family = "sans")
     )
 }
 
+# ============================================================================
 # Create maps
+# ============================================================================
+
 cat("\nCreating maps...\n")
+cat(sprintf("  Using %s text style\n", TEXT_VARIANT))
+cat(sprintf("  Year: %d\n", YEAR))
+
+# Get text for Bayern map (without stations)
+bayern_text <- get_map_text(
+  region = "Bayern",
+  year = YEAR,
+  with_stations = FALSE,
+  variant = TEXT_VARIANT
+)
 
 map_bayern <- make_map(
   bayern,
-  title = "Commute × Clean Air: Bavaria",
-  subtitle = "Bivariate Analysis of Commuting Intensity and NO₂ Air Quality",
-  description = "Data: 2023 | Commuting: Share of workers with ≥50km commute | Air Quality: Annual mean NO₂ (μg/m³)",
-  hill_df = hill_df
+  title = bayern_text$title,
+  subtitle = bayern_text$subtitle,
+  description = bayern_text$caption,
+  hill_df = hill_df,
+  cities_sf = bayern_cities_sf
+)
+
+# Get text for Oberpfalz map (without stations)
+oberpfalz_text <- get_map_text(
+  region = "Oberpfalz",
+  year = YEAR,
+  with_stations = FALSE,
+  variant = TEXT_VARIANT,
+  caption_style = "short",
+  wrap_width = 88
 )
 
 map_oberpfalz <- make_map(
   oberpfalz,
-  title = "Commute × Clean Air: Oberpfalz",
-  subtitle = "Regional Focus on Commuting Patterns and Air Quality",
-  description = "Data: 2023 | Commuting: Share of workers with ≥50km commute | Air Quality: Annual mean NO₂ (μg/m³)",
-  hill_df = hill_df
+  title = oberpfalz_text$title,
+  subtitle = oberpfalz_text$subtitle,
+  description = oberpfalz_text$caption,
+  hill_df = hill_df,
+  cities_sf = oberpfalz_cities_sf
 )
 
 # Create legend
@@ -231,53 +464,124 @@ legend_plot <- create_legend()
 # Combine map and legend
 cat("Combining map and legend...\n")
 
-# Bayern map with legend
+# Bayern map with legend (smaller legend for Bayern)
 bayern_final <- ggdraw() +
   draw_plot(map_bayern, 0, 0, 1, 1) +
-  draw_plot(legend_plot, 0.02, 0.02, 0.25, 0.25)
+  draw_plot(legend_plot, 0.02, 0.02, 0.28, 0.28)  # Smaller for Bayern
 
-# Oberpfalz map with legend
+# Oberpfalz map with legend (larger legend to fit text)
 oberpfalz_final <- ggdraw() +
   draw_plot(map_oberpfalz, 0, 0, 1, 1) +
-  draw_plot(legend_plot, 0.02, 0.02, 0.25, 0.25)
+  draw_plot(legend_plot, 0.02, 0.02, 0.32, 0.32)  # Larger for Oberpfalz
 
+# ============================================================================
 # Save maps
+# ============================================================================
+
 cat("\nSaving maps...\n")
 
 bayern_output <- file.path(OUTPUT_DIR, "bayern_bivariate.png")
 oberpfalz_output <- file.path(OUTPUT_DIR, "oberpfalz_bivariate.png")
 
-ggsave(
-  bayern_output,
-  bayern_final,
-  width = 12,
-  height = 10,
-  dpi = 300,
-  bg = "white"
-)
+# Use Cairo device for PNG if available (better UTF-8 support)
+if (requireNamespace("Cairo", quietly = TRUE)) {
+  ggsave(
+    bayern_output,
+    bayern_final,
+    width = 12,
+    height = 10,
+    dpi = 300,
+    bg = "white",
+    device = Cairo::CairoPNG
+  )
+} else {
+  ggsave(
+    bayern_output,
+    bayern_final,
+    width = 12,
+    height = 10,
+    dpi = 300,
+    bg = "white"
+  )
+}
 cat(sprintf("  Saved: %s\n", bayern_output))
 
-ggsave(
-  oberpfalz_output,
-  oberpfalz_final,
-  width = 10,
-  height = 8,
-  dpi = 300,
-  bg = "white"
-)
+# Use Cairo device for PNG if available (better UTF-8 support)
+if (requireNamespace("Cairo", quietly = TRUE)) {
+  ggsave(
+    oberpfalz_output,
+    oberpfalz_final,
+    width = 10,
+    height = 8,
+    dpi = 300,
+    bg = "white",
+    device = Cairo::CairoPNG
+  )
+} else {
+  ggsave(
+    oberpfalz_output,
+    oberpfalz_final,
+    width = 10,
+    height = 8,
+    dpi = 300,
+    bg = "white"
+  )
+}
 cat(sprintf("  Saved: %s\n", oberpfalz_output))
 
-# Also save as PDF (vector format)
+# Also save as PDF (vector format) - use CairoPDF if available
 bayern_pdf <- file.path(OUTPUT_DIR, "bayern_bivariate.pdf")
 oberpfalz_pdf <- file.path(OUTPUT_DIR, "oberpfalz_bivariate.pdf")
 
-ggsave(bayern_pdf, bayern_final, width = 12, height = 10, bg = "white")
-ggsave(oberpfalz_pdf, oberpfalz_final, width = 10, height = 8, bg = "white")
+if (requireNamespace("Cairo", quietly = TRUE)) {
+  ggsave(bayern_pdf, bayern_final, width = 12, height = 10, bg = "white", device = Cairo::CairoPDF)
+  ggsave(oberpfalz_pdf, oberpfalz_final, width = 10, height = 8, bg = "white", device = Cairo::CairoPDF)
+} else {
+  ggsave(bayern_pdf, bayern_final, width = 12, height = 10, bg = "white")
+  ggsave(oberpfalz_pdf, oberpfalz_final, width = 10, height = 8, bg = "white")
+}
 
 cat(sprintf("  Saved: %s\n", bayern_pdf))
 cat(sprintf("  Saved: %s\n", oberpfalz_pdf))
 
-cat("\n" , rep("=", 60), "\n", sep = "")
+cat("\n", rep("=", 60), "\n", sep = "")
 cat("Map Generation Complete!\n")
 cat(rep("=", 60), "\n", sep = "")
 
+# ============================================================================
+# SANITY CHECK: Visual verification checklist
+# ============================================================================
+# 
+# After generating maps, visually verify:
+# 
+# 1. TYPOGRAPHY:
+#    [ ] NO₂ renders correctly in subtitle, caption, and legend axis labels
+#        (subscript 2 should be visible, not empty square)
+#    [ ] µg/m³ renders correctly (micro symbol µ and superscript 3)
+#    [ ] ≥ symbol renders correctly (not ">=")
+#    [ ] Year ranges use en dash (2019–2023, not 2019-2023)
+# 
+# 2. LEGEND ARROWS:
+#    [ ] X-axis label shows "NO₂ increases →" with proper arrow
+#    [ ] Y-axis label shows "Long-distance commuting increases ↑" with proper arrow
+#    [ ] Arrows point in correct direction (→ right, ↑ up)
+#    [ ] Subscripts render correctly in legend labels
+# 
+# 3. CITY LABELS:
+#    [ ] City labels are readable on both dark and light colored districts
+#    [ ] White text with black halo (or vice versa) provides good contrast
+#    [ ] City square markers are visible (black fill, white stroke)
+#    [ ] Labels don't overlap excessively
+#    [ ] Labels are positioned above square markers
+# 
+# 4. FONT RENDERING:
+#    [ ] All text uses a font that supports Unicode (sans family)
+#    [ ] German umlauts (München, Nürnberg) render correctly
+#    [ ] No empty squares or garbled characters
+# 
+# 5. OUTPUT FILES:
+#    [ ] PNG files saved with Cairo device (better Unicode support)
+#    [ ] PDF files saved with CairoPDF device (vector format with Unicode)
+#    [ ] Files open correctly in image viewers and PDF readers
+# 
+# ============================================================================
